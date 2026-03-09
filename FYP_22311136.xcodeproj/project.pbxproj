@@ -16,6 +16,11 @@
 			path = FYP_22311136;
 			sourceTree = "<group>";
 		};
+		F4AAE5A42F5F3D12007CF170 /* FYP_22311136Tests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = FYP_22311136Tests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -33,6 +38,7 @@
 			isa = PBXGroup;
 			children = (
 				F41D98B62F4770D700C8E7E4 /* FYP_22311136 */,
+				F4AAE5A42F5F3D12007CF170 /* FYP_22311136Tests */,
 				F41D98B52F4770D700C8E7E4 /* Products */,
 			);
 			sourceTree = "<group>";
