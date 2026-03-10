@@ -12,102 +12,129 @@ enum JPEGExtractorError: Error {
 
 final class JPEGExtractor {
 
-    private let JPEG_HEADER: [UInt8] = [0xFF, 0xD8, 0xFF]
-    private let JPEG_FOOTER: [UInt8] = [0xFF, 0xD9]
-
     static let shared: JPEGExtractor? = {
-        do {
-            return try JPEGExtractor()
-        } catch {
-            print("JPEGExtractor init failed: \(error)")
-            return nil
-        }
+        do { return try JPEGExtractor() }
+        catch { print("JPEGExtractor init failed: \(error)"); return nil }
     }()
 
-    // initialising metal environment
-
-    let device: MTLDevice // GPU device
-    let commandQueue: MTLCommandQueue // queue for sending commands to GPU
-    let library: MTLLibrary // compiled GPU functions (shaders)
-    let pipeline: MTLComputePipelineState // compiled state for the compute shader
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let pipeline: MTLComputePipelineState
 
     init() throws {
-
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw JPEGExtractorError.noDevice
-        }
+        guard let device = MTLCreateSystemDefaultDevice()
+        else { throw JPEGExtractorError.noDevice }
         self.device = device
 
-        guard let commandQueue = device.makeCommandQueue() else {
-            throw JPEGExtractorError.commandQueueUnavailable
-        }
-        self.commandQueue = commandQueue
+        guard let queue = device.makeCommandQueue()
+        else { throw JPEGExtractorError.commandQueueUnavailable }
+        self.commandQueue = queue
 
-        guard let library = device.makeDefaultLibrary() else {
-            throw JPEGExtractorError.libraryNotFound
-        }
-        self.library = library
+        guard let library = device.makeDefaultLibrary()
+        else { throw JPEGExtractorError.libraryNotFound }
 
-        guard let function = library.makeFunction(name: "searchPattern") else {
-            throw JPEGExtractorError.functionNotFound
-        }
+        guard let function = library.makeFunction(name: "searchJPEG")
+        else { throw JPEGExtractorError.functionNotFound }
 
-        do {
-            pipeline = try device.makeComputePipelineState(function: function)
-        } catch {
-            throw JPEGExtractorError.pipelineError(error)
-        }
-    }
-    //after initialisation we now have acces to the GPU, command queue, compiled shaders library and compiled searchpattern kernel.
-
-    func findHeaderOffsets(in data: Data) async throws -> [Int] {
-        return try await findOffsets(in: data, signature: JPEG_HEADER)
+        do { pipeline = try device.makeComputePipelineState(function: function) }
+        catch { throw JPEGExtractorError.pipelineError(error) }
     }
 
-    func findFooterOffsets(in data: Data) async throws -> [Int] {
-        return try await findOffsets(in: data, signature: JPEG_FOOTER)
+    // ── Single pass: returns both headers and footers at once ──────────────────
+    
+    private func findHeaderOffsets(in data: Data) async throws -> [Int] {
+        let (headers, _) = try await scan(data: data)
+        return headers
     }
 
-    private func findOffsets(in data: Data, signature: [UInt8]) async throws -> [Int] {
-        let byteArray = [UInt8](data)
-        let bufCount = byteArray.count
-        let signatureLen = signature.count
+    private func findFooterOffsets(in data: Data) async throws -> [Int] {
+        let (_, footers) = try await scan(data: data)
+        return footers
+    }
 
-        guard let dataBuf = device.makeBuffer(bytes: byteArray, length: byteArray.count, options: []) else {
-            throw JPEGExtractorError.bufferCreationFailed
-        }
-        guard let resultBuf = device.makeBuffer(length: bufCount * MemoryLayout<UInt32>.stride, options: []) else {
-            throw JPEGExtractorError.bufferCreationFailed
-        }
+    func scan(data: Data) async throws -> (headers: [Int], footers: [Int]) {
+        let dataSize = data.count
+        // Upper bound: can't have more hits than bytes, but realistically far fewer.
+        // 1 hit per 3 bytes is extremely generous.
+        let maxHits  = max((dataSize / 3) * 2, 128) // *2 because each hit = (offset + type)
 
-        guard let cmd = commandQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else {
-            throw JPEGExtractorError.commandQueueUnavailable
+        // ── Buffers ────────────────────────────────────────────────────────────
+
+        // Zero-copy on Apple Silicon: GPU and CPU share the same physical memory
+        let dataBuffer: MTLBuffer? = data.withUnsafeBytes { ptr in
+            guard let base = ptr.baseAddress else { return nil }
+            return device.makeBuffer(
+                bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                length: dataSize,
+                options: .storageModeShared,
+                deallocator: nil
+            )
         }
+        guard let dataBuffer else { throw JPEGExtractorError.bufferCreationFailed }
+
+        // hits buffer: [offset0, type0, offset1, type1, ...]
+        guard let hitsBuffer = device.makeBuffer(
+            length: maxHits * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else { throw JPEGExtractorError.bufferCreationFailed }
+
+        guard let countBuffer = device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else { throw JPEGExtractorError.bufferCreationFailed }
+
+        // Zero the counter
+        countBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+
+        var dataSizeU32 = UInt32(dataSize)
+
+        // ── Encode ─────────────────────────────────────────────────────────────
+
+        guard let cmd = commandQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder()
+        else { throw JPEGExtractorError.commandQueueUnavailable }
+
         enc.setComputePipelineState(pipeline)
-        enc.setBuffer(dataBuf, offset: 0, index: 0)
-        enc.setBuffer(resultBuf, offset: 0, index: 1)
-        enc.setBytes(signature, length: signatureLen * MemoryLayout<UInt8>.stride, index: 2)
-        var sigLen = UInt32(signatureLen)
-        enc.setBytes(&sigLen, length: MemoryLayout<UInt32>.stride, index: 3)
+        enc.setBuffer(dataBuffer,  offset: 0, index: 0)
+        enc.setBuffer(hitsBuffer,  offset: 0, index: 1)
+        enc.setBuffer(countBuffer, offset: 0, index: 2)
+        enc.setBytes(&dataSizeU32, length: MemoryLayout<UInt32>.stride, index: 3)
 
-
-        let maxThreads = max(1, bufCount - (signatureLen - 1))
-        let threads = MTLSize(width: maxThreads, height: 1, depth: 1)
-        let groupWidth = min(pipeline.maxTotalThreadsPerThreadgroup, 32)
-        let threadsPerGroup = MTLSize(width: max(groupWidth, 1), height: 1, depth: 1)
-
-        enc.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
+        // One thread per byte, 1024 threads per group
+        let threadsPerGrid      = MTLSize(width: dataSize, height: 1, depth: 1)
+        let threadsPerGroup     = MTLSize(
+            width: min(pipeline.maxTotalThreadsPerThreadgroup, 1024),
+            height: 1, depth: 1
+        )
+        enc.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerGroup)
         enc.endEncoding()
-        cmd.commit()
-        cmd.waitUntilCompleted()
-        
-        let resultPointer = resultBuf.contents().bindMemory(to: UInt32.self, capacity: bufCount)
-        var offsets = [Int]()
-        for i in 0..<bufCount {
-            if resultPointer[i] != 0 {
-                offsets.append(i)
+
+        // ── Async completion — no thread blocking ──────────────────────────────
+
+        return try await withCheckedThrowingContinuation { continuation in
+            cmd.addCompletedHandler { [hitsBuffer, countBuffer] _ in
+                let count = Int(countBuffer.contents().load(as: UInt32.self))
+                let hitsPtr = hitsBuffer.contents()
+                    .assumingMemoryBound(to: UInt32.self)
+
+                var headers: [Int] = []
+                var footers: [Int] = []
+
+                let safeCount = min(count, maxHits / 2) // each hit = 2 slots
+                for i in 0..<safeCount {
+                    let offset = Int(hitsPtr[i * 2])
+                    let type   = Int(hitsPtr[i * 2 + 1])
+                    if type == 0 { headers.append(offset) }
+                    else         { footers.append(offset) }
+                }
+
+                // GPU threads complete out of order — sort for correct output
+                headers.sort()
+                footers.sort()
+
+                continuation.resume(returning: (headers, footers))
             }
+            cmd.commit()
         }
-        return offsets
     }
 }
