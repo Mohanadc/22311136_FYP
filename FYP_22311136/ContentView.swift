@@ -173,6 +173,4 @@ struct ContentView: View {
             self.output += result
         }
     }
-
-    // NOTE: header detection is handled by `JPEGExtractor` (Metal GPU). Kept no-CPU fallback here.
 }

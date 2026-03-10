@@ -8,6 +8,13 @@ enum JPEGExtractorError: Error {
     case pipelineError(Error)
     case commandQueueUnavailable
     case bufferCreationFailed
+    case fileReadError
+}
+
+// Represents a matched JPEG in absolute file offsets
+struct JPEGMatch {
+    let headerOffset: Int
+    let footerOffset: Int
 }
 
 final class JPEGExtractor {
@@ -16,6 +23,15 @@ final class JPEGExtractor {
         do { return try JPEGExtractor() }
         catch { print("JPEGExtractor init failed: \(error)"); return nil }
     }()
+
+    // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
+    static let chunkSize    = 64 * 1024 * 1024
+    // Overlap ensures markers straddling chunk boundaries are never missed
+    // 3 bytes covers the longest marker (FF D8 FF)
+    static let overlapSize  = 3
+    // Hard cap on hits per chunk — 64MB / 3 bytes per hit worst case ~= 22M, but
+    // realistically a few thousand. 1MB of hit slots = 256k UInt32 values = 128k hits.
+    static let maxHitsPerChunk = 131_072 // 128k hits per chunk
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -40,28 +56,77 @@ final class JPEGExtractor {
         catch { throw JPEGExtractorError.pipelineError(error) }
     }
 
-    // ── Single pass: returns both headers and footers at once ──────────────────
-    
-    private func findHeaderOffsets(in data: Data) async throws -> [Int] {
-        let (headers, _) = try await scan(data: data)
-        return headers
+    // ── Public entry point: streams a file in chunks ───────────────────────────
+
+    func scanFile(at url: URL) async throws -> [JPEGMatch] {
+        guard let fileHandle = try? FileHandle(forReadingFrom: url)
+        else { throw JPEGExtractorError.fileReadError }
+        defer { try? fileHandle.close() }
+
+        let fileSize = try FileManager.default
+            .attributesOfItem(atPath: url.path)[.size] as? Int ?? 0
+
+        var allHeaders: [Int] = []
+        var allFooters: [Int] = []
+        var fileOffset = 0
+
+        while fileOffset < fileSize {
+            // Read chunk + overlap so markers at boundaries are not split
+            let readSize   = min(Self.chunkSize + Self.overlapSize, fileSize - fileOffset)
+            let chunkData  = fileHandle.readData(ofLength: readSize)
+            if chunkData.isEmpty { break }
+
+            let (headers, footers) = try await scan(data: chunkData)
+
+            // Translate chunk-relative offsets to absolute file offsets,
+            // but skip anything that falls inside the overlap region of the
+            // PREVIOUS chunk (i.e. offset < overlapSize when fileOffset > 0)
+            // to avoid duplicates.
+            let minOffset = fileOffset == 0 ? 0 : Self.overlapSize
+
+            for h in headers where h >= minOffset {
+                allHeaders.append(fileOffset + h)
+            }
+            for f in footers where f >= minOffset {
+                allFooters.append(fileOffset + f)
+            }
+
+            // Advance by chunkSize only — the overlap bytes get re-read next iteration
+            fileOffset += Self.chunkSize
+        }
+
+        return pairHeadersWithFooters(headers: allHeaders, footers: allFooters)
     }
 
-    private func findFooterOffsets(in data: Data) async throws -> [Int] {
-        let (_, footers) = try await scan(data: data)
-        return footers
+    // ── Pairs sorted headers with their nearest following footer ───────────────
+
+    private func pairHeadersWithFooters(
+        headers: [Int],
+        footers: [Int]
+    ) -> [JPEGMatch] {
+        var matches: [JPEGMatch] = []
+        var footerIndex = 0
+
+        for header in headers {
+            // Find the first footer that comes after this header
+            while footerIndex < footers.count && footers[footerIndex] <= header {
+                footerIndex += 1
+            }
+            guard footerIndex < footers.count else { break }
+            matches.append(JPEGMatch(headerOffset: header, footerOffset: footers[footerIndex]))
+            footerIndex += 1
+        }
+
+        return matches
     }
+
+    // ── Single chunk scan — unchanged logic, capped buffer sizes ──────────────
 
     func scan(data: Data) async throws -> (headers: [Int], footers: [Int]) {
         let dataSize = data.count
-        // Upper bound: can't have more hits than bytes, but realistically far fewer.
-        // 1 hit per 3 bytes is extremely generous.
-        let maxHits  = max((dataSize / 3) * 2, 128) // *2 because each hit = (offset + type)
+        let maxHits  = Self.maxHitsPerChunk * 2 // *2 because each hit = (offset + type)
 
-        // ── Buffers ────────────────────────────────────────────────────────────
-
-        // Zero-copy on Apple Silicon: GPU and CPU share the same physical memory
-        let dataBuffer: MTLBuffer? = data.withUnsafeBytes { ptr in
+        guard let dataBuffer: MTLBuffer = data.withUnsafeBytes({ ptr in
             guard let base = ptr.baseAddress else { return nil }
             return device.makeBuffer(
                 bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
@@ -69,10 +134,8 @@ final class JPEGExtractor {
                 options: .storageModeShared,
                 deallocator: nil
             )
-        }
-        guard let dataBuffer else { throw JPEGExtractorError.bufferCreationFailed }
+        }) else { throw JPEGExtractorError.bufferCreationFailed }
 
-        // hits buffer: [offset0, type0, offset1, type1, ...]
         guard let hitsBuffer = device.makeBuffer(
             length: maxHits * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
@@ -83,12 +146,11 @@ final class JPEGExtractor {
             options: .storageModeShared
         ) else { throw JPEGExtractorError.bufferCreationFailed }
 
-        // Zero the counter
         countBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
 
         var dataSizeU32 = UInt32(dataSize)
-
-        // ── Encode ─────────────────────────────────────────────────────────────
+        // Pass the cap to the shader so it stops writing if the buffer is full
+        var maxHitsU32  = UInt32(maxHits)
 
         guard let cmd = commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder()
@@ -99,28 +161,25 @@ final class JPEGExtractor {
         enc.setBuffer(hitsBuffer,  offset: 0, index: 1)
         enc.setBuffer(countBuffer, offset: 0, index: 2)
         enc.setBytes(&dataSizeU32, length: MemoryLayout<UInt32>.stride, index: 3)
+        enc.setBytes(&maxHitsU32,  length: MemoryLayout<UInt32>.stride, index: 4)
 
-        // One thread per byte, 1024 threads per group
-        let threadsPerGrid      = MTLSize(width: dataSize, height: 1, depth: 1)
-        let threadsPerGroup     = MTLSize(
+        let threadsPerGrid  = MTLSize(width: dataSize, height: 1, depth: 1)
+        let threadsPerGroup = MTLSize(
             width: min(pipeline.maxTotalThreadsPerThreadgroup, 1024),
             height: 1, depth: 1
         )
         enc.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerGroup)
         enc.endEncoding()
 
-        // ── Async completion — no thread blocking ──────────────────────────────
-
         return try await withCheckedThrowingContinuation { continuation in
             cmd.addCompletedHandler { [hitsBuffer, countBuffer] _ in
-                let count = Int(countBuffer.contents().load(as: UInt32.self))
-                let hitsPtr = hitsBuffer.contents()
-                    .assumingMemoryBound(to: UInt32.self)
+                let count   = Int(countBuffer.contents().load(as: UInt32.self))
+                let hitsPtr = hitsBuffer.contents().assumingMemoryBound(to: UInt32.self)
 
                 var headers: [Int] = []
                 var footers: [Int] = []
 
-                let safeCount = min(count, maxHits / 2) // each hit = 2 slots
+                let safeCount = min(count / 2, Self.maxHitsPerChunk)
                 for i in 0..<safeCount {
                     let offset = Int(hitsPtr[i * 2])
                     let type   = Int(hitsPtr[i * 2 + 1])
@@ -128,10 +187,8 @@ final class JPEGExtractor {
                     else         { footers.append(offset) }
                 }
 
-                // GPU threads complete out of order — sort for correct output
                 headers.sort()
                 footers.sort()
-
                 continuation.resume(returning: (headers, footers))
             }
             cmd.commit()
