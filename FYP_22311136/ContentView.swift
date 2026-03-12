@@ -89,14 +89,6 @@ struct ContentView: View {
                     }
                 }
 
-                // Options
-                VStack(alignment: .leading, spacing: 8) {
-                    Toggle("Show hex preview (first 512 bytes)", isOn: $showHexPreview)
-                }
-                .padding()
-                .background(.thickMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
                 // Output / log
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
