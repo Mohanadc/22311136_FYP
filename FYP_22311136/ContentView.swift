@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var selectedFilePath: String = ""
     @State private var selectedFileName: String = ""
     @State private var isCarving = false
+    @State private var finishedCarving = false
     @State private var showHexPreview: Bool = false
     @State private var savedFileURLs: [URL] = []
 
@@ -56,12 +57,12 @@ struct ContentView: View {
                 // Actions row
                 HStack(spacing: 12) {
                     Button(action: startCarving) {
-                        Label(isCarving ? "Carving…" : "Start Carving", systemImage: "play.fill")
+                        Label(isCarving ? "Carving…" : finishedCarving ? "Select another file to carve." : "Start Carving", systemImage: "play.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
-                    .disabled(selectedFilePath.isEmpty || isCarving)
+                    .disabled(selectedFilePath.isEmpty || isCarving || finishedCarving)
 
                     Button(action: revealInFinder) {
                         Label("Reveal", systemImage: "folder")
@@ -69,6 +70,12 @@ struct ContentView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(savedFileURLs.isEmpty || isCarving)
+                }
+
+                if finishedCarving {
+                    Text("Carving finished. Select another file to carve.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 // Status / progress
@@ -121,6 +128,7 @@ struct ContentView: View {
             selectedFilePath = url.path
             selectedFileName = url.lastPathComponent
             savedFileURLs = []
+            finishedCarving = false
             output = "Selected: \(selectedFileName)\nPath: \(selectedFilePath)"
         case .failure(let error):
             output = "Selection error: \(error.localizedDescription)"
@@ -131,6 +139,7 @@ struct ContentView: View {
         guard !selectedFilePath.isEmpty else { return }
         isCarving = true
         savedFileURLs = []
+        finishedCarving = false
         output = "Starting JPEG carving...\n"
 
         Task {
@@ -143,11 +152,13 @@ struct ContentView: View {
                     output += "Time elapsed: \(String(format: "%.2f", elapsed))s\n"
                     output += "\n✓ JPEG carving complete!"
                     isCarving = false
+                    finishedCarving = true
                 }
             } catch {
                 await MainActor.run {
                     output = "Error: \(error.localizedDescription)"
                     isCarving = false
+                    finishedCarving = false
                 }
             }
         }
