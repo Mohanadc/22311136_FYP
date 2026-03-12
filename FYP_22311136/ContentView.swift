@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 import Metal
 
@@ -214,8 +215,9 @@ struct ContentView: View {
             return
         }
 
-        // ── Extract and save each JPEG ────────────────────────────────────────
+        // ── Extract, validate (decode), and save each JPEG ─────────────────────
         var urls: [URL] = []
+        var lastSavedEnd: Int = -1
 
         for (index, match) in matches.enumerated() {
             let header = match.headerOffset
@@ -231,32 +233,51 @@ struct ContentView: View {
                 continue
             }
 
-            // Slice the exact bytes from header to end of footer marker
-            let jpegData = fileData[header..<end]
-
-            // ── Validate before saving ────────────────────────────────────────
-            let validation = extractor.validateJPEG(data: Data(jpegData))
-            if !validation.isValid {
+            if lastSavedEnd >= 0 && header < lastSavedEnd {
                 await MainActor.run {
-                    output += "[\(index)] SKIPPED — failed validation: \(validation.reason)\n"
-                    output += "     Header: 0x\(String(header, radix: 16, uppercase: true))"
-                    output += "  Footer: 0x\(String(footer, radix: 16, uppercase: true))\n"
+                    output += "[\(index)] NOTE — header overlaps previous saved JPEG (header: \(header) < lastSavedEnd: \(lastSavedEnd)). Will attempt validation and save if it decodes.\n"
+                }
+            }
+
+            // Slice the exact bytes from header to end of footer marker
+            let jpegSlice = fileData[header..<end]
+            let jpegData = Data(jpegSlice)
+
+            // Quick marker-level sanity check: starts with FF D8 and ends with FF D9
+            let bytes = [UInt8](jpegData)
+            if bytes.count < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[bytes.count - 2] != 0xFF || bytes[bytes.count - 1] != 0xD9 {
+                await MainActor.run {
+                    output += "[\(index)] SKIPPED — marker sanity check failed (missing SOI/EOI)\n"
                 }
                 continue
             }
 
-            let outputURL = outputFolder
-                .appendingPathComponent("carved_\(index).jpg")
+            // Try to decode the bytes with Image I/O to ensure it's a valid image
+            var decodedOK = false
+            if let src = CGImageSourceCreateWithData(jpegData as CFData, nil) {
+                if CGImageSourceGetCount(src) > 0,
+                   let _ = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+                    decodedOK = true
+                }
+            }
 
+            if !decodedOK {
+                await MainActor.run {
+                    output += "[\(index)] SKIPPED — failed to decode carved bytes as an image\n"
+                }
+                continue
+            }
+
+            let outputURL = outputFolder.appendingPathComponent("carved_\(index).jpg")
             do {
                 try jpegData.write(to: outputURL, options: .atomic)
                 urls.append(outputURL)
                 await MainActor.run {
-                    output += "[\(index)] ✓ \(validation.reason)\n"
-                    output += "     Saved \(jpegData.count) bytes → carved_\(index).jpg\n"
+                    output += "[\(index)] Saved \(jpegData.count) bytes → carved_\(index).jpg\n"
                     output += "     Header: 0x\(String(header, radix: 16, uppercase: true))"
                     output += "  Footer: 0x\(String(footer, radix: 16, uppercase: true))\n"
                 }
+                lastSavedEnd = end
             } catch {
                 await MainActor.run {
                     output += "[\(index)] Failed to write: \(error.localizedDescription)\n"
