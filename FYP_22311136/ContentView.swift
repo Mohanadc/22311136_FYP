@@ -13,73 +13,106 @@ struct ContentView: View {
     @State private var savedFileURLs: [URL] = []
 
     var body: some View {
-        VStack(spacing: 12) {
-            Text("JPEG Carver")
-                .font(.headline)
-
-            if selectedFileName.isEmpty {
-                Button(action: { isSelectingFile = true }) {
-                    Label("Select Raw Image (.img/.dmg/.iso)", systemImage: "doc.fill")
-                        .padding(8)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // Header
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("JPEG Carver")
+                        .font(.title2).bold()
+                    Text("Select a disk image, scan for JPEGs, validate, and save them.")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
                 }
+
+                // File card
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "externaldrive")
+                            .foregroundColor(.accentColor)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(selectedFileName.isEmpty ? "No file selected" : selectedFileName)
+                                .font(.headline)
+                            Text(selectedFilePath.isEmpty ? "Choose a raw image (.img/.dmg/.iso)" : selectedFilePath)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer()
+                        Button(selectedFileName.isEmpty ? "Select" : "Change") {
+                            isSelectingFile = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding()
+                .background(.ultraThickMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .fileImporter(
                     isPresented: $isSelectingFile,
                     allowedContentTypes: [.item],
                     onCompletion: handleSelection
                 )
-            } else {
-                HStack {
-                    Text("Selected:")
-                        .font(.caption)
-                    Text(selectedFileName)
-                        .font(.caption)
-                        .fontWeight(.bold)
-                        .foregroundColor(.green)
 
-                    Spacer()
+                // Actions row
+                HStack(spacing: 12) {
+                    Button(action: startCarving) {
+                        Label(isCarving ? "Carving…" : "Start Carving", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .disabled(selectedFilePath.isEmpty || isCarving)
 
-                    Button("Change") { isSelectingFile = true }
-                        .fileImporter(
-                            isPresented: $isSelectingFile,
-                            allowedContentTypes: [.item],
-                            onCompletion: handleSelection
-                        )
+                    Button(action: revealInFinder) {
+                        Label("Reveal", systemImage: "folder")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(savedFileURLs.isEmpty || isCarving)
+                }
+
+                // Status / progress
+                if isCarving {
+                    HStack {
+                        ProgressView()
+                        Text("Working… This may take a moment.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // Options
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Show hex preview (first 512 bytes)", isOn: $showHexPreview)
                 }
                 .padding()
-            }
+                .background(.thickMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-            if !selectedFilePath.isEmpty && !isCarving {
-                Button(action: startCarving) {
-                    Label("Start Carving", systemImage: "play.fill")
-                        .padding(8)
+                // Output / log
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Activity Log")
+                            .font(.headline)
+                        Spacer()
+                        if !isCarving {
+                            Button("Clear") { output = "" }
+                                .font(.caption)
+                        }
+                    }
+                    ScrollView {
+                        Text(output)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                    .frame(minHeight: 220)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
             }
-
-            if isCarving {
-                ProgressView()
-                    .padding()
-            }
-
-            // Show a "Reveal in Finder" button once files have been saved
-            if !savedFileURLs.isEmpty && !isCarving {
-                Button(action: revealInFinder) {
-                    Label("Reveal Carved JPEGs in Finder", systemImage: "folder")
-                        .padding(8)
-                }
-                .foregroundColor(.blue)
-            }
-
-            Toggle("Show hex preview (first 512 bytes)", isOn: $showHexPreview)
-                .padding(.horizontal)
-
-            ScrollView {
-                Text(output)
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .font(.system(.caption, design: .monospaced))
-            }
+            .padding()
         }
-        .padding()
     }
 
     private func handleSelection(_ result: Result<URL, Error>) {
@@ -190,6 +223,17 @@ struct ContentView: View {
             // Slice the exact bytes from header to end of footer marker
             let jpegData = fileData[header..<end]
 
+            // ── Validate before saving ────────────────────────────────────────
+            let validation = extractor.validateJPEG(data: Data(jpegData))
+            if !validation.isValid {
+                await MainActor.run {
+                    output += "[\(index)] SKIPPED — failed validation: \(validation.reason)\n"
+                    output += "     Header: 0x\(String(header, radix: 16, uppercase: true))"
+                    output += "  Footer: 0x\(String(footer, radix: 16, uppercase: true))\n"
+                }
+                continue
+            }
+
             let outputURL = outputFolder
                 .appendingPathComponent("carved_\(index).jpg")
 
@@ -197,7 +241,8 @@ struct ContentView: View {
                 try jpegData.write(to: outputURL, options: .atomic)
                 urls.append(outputURL)
                 await MainActor.run {
-                    output += "[\(index)] Saved \(jpegData.count) bytes → carved_\(index).jpg\n"
+                    output += "[\(index)] ✓ \(validation.reason)\n"
+                    output += "     Saved \(jpegData.count) bytes → carved_\(index).jpg\n"
                     output += "     Header: 0x\(String(header, radix: 16, uppercase: true))"
                     output += "  Footer: 0x\(String(footer, radix: 16, uppercase: true))\n"
                 }
