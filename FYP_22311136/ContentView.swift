@@ -199,15 +199,6 @@ struct ContentView: View {
         let outputFolder = try makeOutputFolder(for: fileURL)
         await MainActor.run { output += "Output folder: \(outputFolder.path)\n" }
 
-        // ── Read file ─────────────────────────────────────────────────────────
-        let fileData: Data
-        do {
-            fileData = try Data(contentsOf: fileURL)
-        } catch {
-            throw NSError(domain: "CarverError", code: -3,
-                          userInfo: [NSLocalizedDescriptionKey: "Cannot read file: \(filePath)"])
-        }
-
         await MainActor.run { output += "File: \(fileURL.lastPathComponent)\n" }
 
         guard let extractor = Extractor.shared else {
@@ -215,8 +206,9 @@ struct ContentView: View {
                           userInfo: [NSLocalizedDescriptionKey: "Extractor (Metal) not available"])
         }
 
-        // ── Scan ──────────────────────────────────────────────────────────────
-        let matches = try await extractor.scanFile(at: fileURL, at: selectedFileTypes)
+        // ── Scan (streaming) ───────────────────────────────────────────────────
+        // Use the URL-based streaming scan to avoid loading the whole file into memory.
+        let matches = try await extractor.scanFile(url: fileURL, at: selectedFileTypes)
 
         await MainActor.run {
             output += "Found \(matches.count) JPEG(s)\n\n--- CARVING ---\n"
@@ -227,9 +219,16 @@ struct ContentView: View {
             return
         }
 
-        // ── Extract, validate (decode), and save each JPEG ─────────────────────
+        // ── Extract, validate (decode), and save each JPEG (read slices from disk) ─
         var urls: [URL] = []
         var lastSavedEnd: Int = -1
+
+        // Open a FileHandle once for reading carved ranges
+        guard let fileHandle = try? FileHandle(forReadingFrom: fileURL) else {
+            throw NSError(domain: "CarverError", code: -5,
+                          userInfo: [NSLocalizedDescriptionKey: "Cannot open file for reading: \(filePath)"])
+        }
+        defer { try? fileHandle.close() }
 
         for (index, match) in matches.enumerated() {
             let header = match.headerOffset
@@ -238,7 +237,10 @@ struct ContentView: View {
             // footer points to the FF D9 marker — the JPEG ends 2 bytes after it
             let end = footer + 2
 
-            guard header < end, end <= fileData.count else {
+            // Ensure the requested range is valid with respect to file size
+            let fileAttributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let fileSize = fileAttributes[.size] as? Int ?? 0
+            guard header < end, end <= fileSize else {
                 await MainActor.run {
                     output += "[\(index)] Skipped — invalid range \(header)..<\(end)\n"
                 }
@@ -251,9 +253,10 @@ struct ContentView: View {
                 }
             }
 
-            // Slice the exact bytes from header to end of footer marker
-            let jpegSlice = fileData[header..<end]
-            let jpegData = Data(jpegSlice)
+            // Read the exact bytes from disk by seeking and reading the range
+            try fileHandle.seek(toOffset: UInt64(header))
+            let length = end - header
+            let jpegData = fileHandle.readData(ofLength: length)
 
             // Quick marker-level sanity check: starts with FF D8 and ends with FF D9
             let bytes = [UInt8](jpegData)

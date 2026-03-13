@@ -76,7 +76,7 @@ final class Extractor {
 
     // ── Public entry point: streams a file in chunks ───────────────────────────
 
-    func scanFile(at url: URL, at fileTypes: Set<FileType>) async throws -> [Match] {
+    func scanFile(url: URL, at fileTypes: Set<FileType>) async throws -> [Match] {
         if(fileTypes.isEmpty) {
             throw ExtractorError.noFileTypesSelected
         }
