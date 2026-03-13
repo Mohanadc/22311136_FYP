@@ -1,7 +1,7 @@
 import Foundation
 import Metal
 
-enum JPEGExtractorError: Error {
+enum ExtractorError: Error {
     case noDevice
     case libraryNotFound
     case functionNotFound
@@ -9,58 +9,79 @@ enum JPEGExtractorError: Error {
     case commandQueueUnavailable
     case bufferCreationFailed
     case fileReadError
+    case noFileTypesSelected
 }
 
-// Represents a matched JPEG in absolute file offsets
-struct JPEGMatch {
+enum FileType: UInt32 {
+    case jpeg = 0
+}
+
+struct FileSignature {
+    let type: FileType
+    let header: [UInt8]
+    let footer: [UInt8]
+}
+
+// Represents a matched file type with header/footer offsets in absolute file coordinates
+struct Match {
+    let fileType: FileType
     let headerOffset: Int
     let footerOffset: Int
 }
 
-final class JPEGExtractor {
+final class Extractor {
 
-    static let shared: JPEGExtractor? = {
-        do { return try JPEGExtractor() }
-        catch { print("JPEGExtractor init failed: \(error)"); return nil }
+    static let shared: Extractor? = {
+        do { return try Extractor() }
+        catch { print("Extractor init failed: \(error)"); return nil }
     }()
 
     // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
-    static let chunkSize    = 64 * 1024 * 1024
+    static let chunkSize = 64 * 1024 * 1024
+
     // Overlap ensures markers straddling chunk boundaries are never missed
-    // 3 bytes covers the longest marker (FF D8 FF)
     static let overlapSize  = 3
+
     // Hard cap on hits per chunk — 64MB / 3 bytes per hit worst case ~= 22M, but
     // realistically a few thousand. 1MB of hit slots = 256k UInt32 values = 128k hits.
     static let maxHitsPerChunk = 131_072 // 128k hits per chunk
+
+    static let signatures: [FileSignature] = [
+       .init(type: .jpeg, header: [0xFF, 0xD8, 0xFF], footer: [0xFF, 0xD9])
+]
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
 
+
+
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice()
-        else { throw JPEGExtractorError.noDevice }
+        else { throw ExtractorError.noDevice }
         self.device = device
 
         guard let queue = device.makeCommandQueue()
-        else { throw JPEGExtractorError.commandQueueUnavailable }
+        else { throw ExtractorError.commandQueueUnavailable }
         self.commandQueue = queue
 
         guard let library = device.makeDefaultLibrary()
-        else { throw JPEGExtractorError.libraryNotFound }
-
+        else { throw ExtractorError.libraryNotFound }   
         guard let function = library.makeFunction(name: "searchJPEG")
-        else { throw JPEGExtractorError.functionNotFound }
+        else { throw ExtractorError.functionNotFound }
 
         do { pipeline = try device.makeComputePipelineState(function: function) }
-        catch { throw JPEGExtractorError.pipelineError(error) }
+        catch { throw ExtractorError.pipelineError(error) }
     }
 
     // ── Public entry point: streams a file in chunks ───────────────────────────
 
-    func scanFile(at url: URL) async throws -> [JPEGMatch] {
+    func scanFile(at url: URL, at fileTypes: Set<FileType>) async throws -> [Match] {
+        if(fileTypes.isEmpty) {
+            throw ExtractorError.noFileTypesSelected
+        }
         guard let fileHandle = try? FileHandle(forReadingFrom: url)
-        else { throw JPEGExtractorError.fileReadError }
+        else { throw ExtractorError.fileReadError }
         defer { try? fileHandle.close() }
 
         let fileSize = try FileManager.default
@@ -103,8 +124,8 @@ final class JPEGExtractor {
     private func pairHeadersWithFooters(
         headers: [Int],
         footers: [Int]
-    ) -> [JPEGMatch] {
-        var matches: [JPEGMatch] = []
+    ) -> [Match] {
+        var matches: [Match] = []
         var footerIndex = 0
 
         for header in headers {
@@ -113,7 +134,7 @@ final class JPEGExtractor {
                 footerIndex += 1
             }
             guard footerIndex < footers.count else { break }
-            matches.append(JPEGMatch(headerOffset: header, footerOffset: footers[footerIndex]))
+            matches.append(Match(fileType: .jpeg, headerOffset: header, footerOffset: footers[footerIndex]))
             footerIndex += 1
         }
 
@@ -134,17 +155,17 @@ final class JPEGExtractor {
                 options: .storageModeShared,
                 deallocator: nil
             )
-        }) else { throw JPEGExtractorError.bufferCreationFailed }
+        }) else { throw ExtractorError.bufferCreationFailed }
 
         guard let hitsBuffer = device.makeBuffer(
             length: maxHits * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
-        ) else { throw JPEGExtractorError.bufferCreationFailed }
+        ) else { throw ExtractorError.bufferCreationFailed }
 
         guard let countBuffer = device.makeBuffer(
             length: MemoryLayout<UInt32>.stride,
             options: .storageModeShared
-        ) else { throw JPEGExtractorError.bufferCreationFailed }
+        ) else { throw ExtractorError.bufferCreationFailed }
 
         countBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
 
@@ -154,7 +175,7 @@ final class JPEGExtractor {
 
         guard let cmd = commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder()
-        else { throw JPEGExtractorError.commandQueueUnavailable }
+        else { throw ExtractorError.commandQueueUnavailable }
 
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(dataBuffer,  offset: 0, index: 0)

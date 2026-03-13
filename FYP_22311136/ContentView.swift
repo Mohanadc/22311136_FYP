@@ -11,8 +11,12 @@ struct ContentView: View {
     @State private var selectedFileName: String = ""
     @State private var isCarving = false
     @State private var finishedCarving = false
-    @State private var showHexPreview: Bool = false
     @State private var savedFileURLs: [URL] = []
+
+    // Available file types to display; populate from your supported signatures
+    @State private var fileTypes: [FileType] = [.jpeg]
+    // User-selected file types to scan
+    @State private var selectedFileTypes: Set<FileType> = [.jpeg]
 
     var body: some View {
         ScrollView {
@@ -58,12 +62,12 @@ struct ContentView: View {
                 // Actions row
                 HStack(spacing: 12) {
                     Button(action: startCarving) {
-                        Label(isCarving ? "Carving…" : finishedCarving ? "Select another file to carve." : "Start Carving", systemImage: "play.fill")
+                        Label(startButtonLabel, systemImage: "play.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
-                    .disabled(selectedFilePath.isEmpty || isCarving || finishedCarving)
+                    .disabled(startButtonDisabled)
 
                     Button(action: revealInFinder) {
                         Label("Reveal", systemImage: "folder")
@@ -89,6 +93,22 @@ struct ContentView: View {
                     }
                 }
 
+                // Options
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("File types to scan")
+                        .font(.headline)
+                    ForEach(fileTypes, id: \.self) { type in
+                        Toggle(label(for: type), isOn: Binding(
+                            get: { selectedFileTypes.contains(type) },
+                            set: { isOn in
+                                if isOn { selectedFileTypes.insert(type) }
+                                else { selectedFileTypes.remove(type) }
+                            }
+                        ))
+                    }
+                }
+                .padding()
+                .background(.thickMaterial)
                 // Output / log
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -129,11 +149,11 @@ struct ContentView: View {
     }
 
     private func startCarving() {
-        guard !selectedFilePath.isEmpty else { return }
+        guard !startButtonDisabled else { output = startButtonLabel; return }
         isCarving = true
         savedFileURLs = []
         finishedCarving = false
-        output = "Starting JPEG carving...\n"
+    output = "Starting carving for: \(selectedFileTypesText)\n"
 
         Task {
             do {
@@ -190,13 +210,13 @@ struct ContentView: View {
 
         await MainActor.run { output += "File: \(fileURL.lastPathComponent)\n" }
 
-        guard let extractor = JPEGExtractor.shared else {
+        guard let extractor = Extractor.shared else {
             throw NSError(domain: "CarverError", code: -4,
-                          userInfo: [NSLocalizedDescriptionKey: "JPEGExtractor (Metal) not available"])
+                          userInfo: [NSLocalizedDescriptionKey: "Extractor (Metal) not available"])
         }
 
         // ── Scan ──────────────────────────────────────────────────────────────
-        let matches = try await extractor.scanFile(at: fileURL)
+        let matches = try await extractor.scanFile(at: fileURL, at: selectedFileTypes)
 
         await MainActor.run {
             output += "Found \(matches.count) JPEG(s)\n\n--- CARVING ---\n"
@@ -302,4 +322,53 @@ struct ContentView: View {
         )
         return folder
     }
+
+    private func label(for type: FileType) -> String {
+        switch type {
+        case .jpeg: return "JPEG"
+        }
+    }
+
+    private var selectedFileTypesText: String {
+        if selectedFileTypes.isEmpty { return "None" }
+        return selectedFileTypes.map(label(for:)).sorted().joined(separator: ", ")
+    }
+
+    private var startButtonLabel: String {
+    if isCarving { return "Carving…" }
+    if finishedCarving { return "Select another file to carve." }
+    if selectedFileTypes.isEmpty { return "Please select file types to begin carving." }
+    return "Start Carving"
+    }
+
+    private var startButtonDisabled: Bool {
+        selectedFilePath.isEmpty || isCarving || finishedCarving || selectedFileTypes.isEmpty
+    }
+
+    // MARK: - Testable helpers
+    // Static, pure helpers mirror the instance logic and are easy to unit test.
+    static func startButtonLabel(isCarving: Bool, finishedCarving: Bool, selectedFileTypesEmpty: Bool) -> String {
+        if isCarving { return "Carving…" }
+        if finishedCarving { return "Select another file to carve." }
+        if selectedFileTypesEmpty { return "Select file types" }
+        return "Start Carving"
+    }
+
+    static func isStartButtonDisabled(selectedFilePathEmpty: Bool, isCarving: Bool, finishedCarving: Bool, selectedFileTypesEmpty: Bool) -> Bool {
+        selectedFilePathEmpty || isCarving || finishedCarving || selectedFileTypesEmpty
+    }
+
+    static func isRevealButtonDisabled(savedFileURLsEmpty: Bool, isCarving: Bool) -> Bool {
+        savedFileURLsEmpty || isCarving
+    }
+
+    static func selectButtonLabel(selectedFileNameEmpty: Bool) -> String {
+        selectedFileNameEmpty ? "Select" : "Change"
+    }
+
+    static func isClearVisible(isCarving: Bool) -> Bool {
+        !isCarving
+    }
+
+
 }
