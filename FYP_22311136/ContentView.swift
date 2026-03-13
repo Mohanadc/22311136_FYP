@@ -197,9 +197,8 @@ struct ContentView: View {
         // Creates a subfolder named after the source file inside ~/Documents/CarvedJPEGs/
         // e.g. ~/Documents/CarvedJPEGs/disk_image/carved_0.jpg
         let outputFolder = try makeOutputFolder(for: fileURL)
-        await MainActor.run { output += "Output folder: \(outputFolder.path)\n" }
-
-        await MainActor.run { output += "File: \(fileURL.lastPathComponent)\n" }
+        await MainActor.run { output += "Output folder: \(outputFolder.path)\n"
+        output += "File: \(fileURL.lastPathComponent)\n"  }
 
         guard let extractor = Extractor.shared else {
             throw NSError(domain: "CarverError", code: -4,
@@ -237,9 +236,11 @@ struct ContentView: View {
             // footer points to the FF D9 marker — the JPEG ends 2 bytes after it
             let end = footer + 2
 
-            // Ensure the requested range is valid with respect to file size
+           
             let fileAttributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
             let fileSize = fileAttributes[.size] as? Int ?? 0
+
+             // Ensure the requested range is valid with respect to file size
             guard header < end, end <= fileSize else {
                 await MainActor.run {
                     output += "[\(index)] Skipped — invalid range \(header)..<\(end)\n"
@@ -308,14 +309,12 @@ struct ContentView: View {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Creates ~/Documents/CarvedJPEGs/<source file stem>/ and returns its URL.
+    /// Creates <source-folder>/CarvedJPEGs/<source file stem>/ and returns its URL.
+    /// This places the carved output next to the source file instead of in ~/Documents.
     private func makeOutputFolder(for sourceURL: URL) throws -> URL {
-        let documents = FileManager.default.urls(
-            for: .documentDirectory, in: .userDomainMask
-        ).first!
-
+        let parent = sourceURL.deletingLastPathComponent()
         let stem = sourceURL.deletingPathExtension().lastPathComponent
-        let folder = documents
+        let folder = parent
             .appendingPathComponent("CarvedJPEGs")
             .appendingPathComponent(stem)
 
