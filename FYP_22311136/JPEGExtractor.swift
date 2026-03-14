@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 
+// Errors that can occur while initializing or running the extractor
 enum ExtractorError: Error {
     case noDevice
     case libraryNotFound
@@ -12,10 +13,12 @@ enum ExtractorError: Error {
     case noFileTypesSelected
 }
 
+// Supported file types and their numeric IDs (used by the GPU shader)
 enum FileType: UInt32 {
     case jpeg = 0
 }
 
+// A file signature containing header and footer byte sequences
 struct FileSignature {
     let type: FileType
     let header: [UInt8]
@@ -29,6 +32,7 @@ struct Match {
     let footerOffset: Int
 }
 
+// Metal-backed extractor that scans file data in chunks for known file signatures
 final class Extractor {
 
     static let shared: Extractor? = {
@@ -36,19 +40,21 @@ final class Extractor {
         catch { print("Extractor init failed: \(error)"); return nil }
     }()
 
-    // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
-    static let chunkSize = 64 * 1024 * 1024
+     // Chunking and buffer sizing constants used for GPU scanning
+     // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
+     static let chunkSize = 64 * 1024 * 1024
 
-    // Overlap ensures markers straddling chunk boundaries are never missed
-    static let overlapSize  = 3
+     // Overlap ensures markers straddling chunk boundaries are never missed
+     static let overlapSize  = 3
 
-    // Hard cap on hits per chunk — 64MB / 3 bytes per hit worst case ~= 22M, but
-    // realistically a few thousand. 1MB of hit slots = 256k UInt32 values = 128k hits.
-    static let maxHitsPerChunk = 131_072 // 128k hits per chunk
+     // Hard cap on hits per chunk — bounds GPU buffer size and host processing work
+     // 1MB of hit slots = 256k UInt32 values = 128k hits.
+     static let maxHitsPerChunk = 131_072 // 128k hits per chunk
 
-    static let signatures: [FileSignature] = [
-       .init(type: .jpeg, header: [0xFF, 0xD8, 0xFF], footer: [0xFF, 0xD9])
-]
+     // Known signatures to scan for (header/footer pairs)
+     static let signatures: [FileSignature] = [
+         .init(type: .jpeg, header: [0xFF, 0xD8, 0xFF], footer: [0xFF, 0xD9])
+     ]
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -56,6 +62,7 @@ final class Extractor {
 
 
 
+    // Initialize Metal device, create command queue and compile the compute pipeline
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice()
         else { throw ExtractorError.noDevice }
@@ -74,8 +81,8 @@ final class Extractor {
         catch { throw ExtractorError.pipelineError(error) }
     }
 
-    // ── Public entry point: streams a file in chunks ───────────────────────────
-
+    // Public entry point: stream the file in fixed-size chunks, run GPU scan on
+    // each chunk and return absolute header/footer offsets found across the file.
     func scanFile(url: URL, at fileTypes: Set<FileType>) async throws -> [Match] {
         if(fileTypes.isEmpty) {
             throw ExtractorError.noFileTypesSelected
@@ -119,8 +126,7 @@ final class Extractor {
         return pairHeadersWithFooters(headers: allHeaders, footers: allFooters)
     }
 
-    // ── Pairs sorted headers with their nearest following footer ───────────────
-
+    // Pair sorted headers with their nearest following footer to construct matches
     private func pairHeadersWithFooters(
         headers: [Int],
         footers: [Int]
@@ -141,12 +147,16 @@ final class Extractor {
         return matches
     }
 
-    // ── Single chunk scan — unchanged logic, capped buffer sizes ──────────────
-
+    // Run the Metal compute shader on a single data chunk and return the
+    // header/footer offsets that the GPU identified (chunk-local offsets).
     func scan(data: Data) async throws -> (headers: [Int], footers: [Int]) {
         let dataSize = data.count
         let maxHits  = Self.maxHitsPerChunk * 2 // *2 because each hit = (offset + type)
 
+        // Create GPU buffers:
+        // - dataBuffer shares the chunk data with the GPU without copying
+        // - hitsBuffer is where the GPU writes found offsets and types (UInt32 pairs)
+        // - countBuffer is a single UInt32 that the GPU atomically increments for each hit
         guard let dataBuffer: MTLBuffer = data.withUnsafeBytes({ ptr in
             guard let base = ptr.baseAddress else { return nil }
             return device.makeBuffer(
@@ -193,26 +203,47 @@ final class Extractor {
         enc.endEncoding()
 
         return try await withCheckedThrowingContinuation { continuation in
+            // Bridge the GPU's asynchronous command-buffer completion into async/await.
+            // The command buffer runs on the GPU; when it finishes the completion
+            // handler is invoked and we can safely read back GPU-produced buffers.
             cmd.addCompletedHandler { [hitsBuffer, countBuffer] _ in
-                let count   = Int(countBuffer.contents().load(as: UInt32.self))
-                let hitsPtr = hitsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+                // Read how many UInt32 slots the GPU wrote into countBuffer.
+                // (Each hit is two UInt32s: offset + type.)
+                let count = Int(countBuffer.contents().load(as: UInt32.self))
 
-                var headers: [Int] = []
-                var footers: [Int] = []
+                // Parse the raw hits buffer into sorted header/footer arrays.
+                // parseHits handles clamping to the allocated capacity and sorting.
+                let (headers, footers) = self.parseHits(hitsBuffer: hitsBuffer, count: count)
 
-                let safeCount = min(count / 2, Self.maxHitsPerChunk)
-                for i in 0..<safeCount {
-                    let offset = Int(hitsPtr[i * 2])
-                    let type   = Int(hitsPtr[i * 2 + 1])
-                    if type == 0 { headers.append(offset) }
-                    else         { footers.append(offset) }
-                }
-
-                headers.sort()
-                footers.sort()
+                // Resume the awaiting async caller with the parsed results.
                 continuation.resume(returning: (headers, footers))
             }
+
+            // Submit the command buffer to the GPU for execution.
+            // The completion handler above will run after the GPU work finishes.
             cmd.commit()
         }
+    }
+
+    // Parse the raw GPU hits buffer into sorted header/footer offset arrays.
+    // - `hitsBuffer` contains pairs of UInt32 (offset, type)
+    // - `count` is the number of UInt32 slots the GPU wrote (may be > 2*maxHitsPerChunk)
+    private func parseHits(hitsBuffer: MTLBuffer, count: Int) -> (headers: [Int], footers: [Int]) {
+        let hitsPtr = hitsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+
+        var headers: [Int] = []
+        var footers: [Int] = []
+
+        let safeCount = min(count / 2, Self.maxHitsPerChunk)
+        for i in 0..<safeCount {
+            let offset = Int(hitsPtr[i * 2])
+            let type   = Int(hitsPtr[i * 2 + 1])
+            if type == 0 { headers.append(offset) }
+            else         { footers.append(offset) }
+        }
+
+        headers.sort()
+        footers.sort()
+        return (headers, footers)
     }
 }

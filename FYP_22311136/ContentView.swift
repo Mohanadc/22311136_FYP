@@ -309,19 +309,19 @@ struct ContentView: View {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Creates <source-folder>/CarvedJPEGs/<source file stem>/ and returns its URL.
-    /// This places the carved output next to the source file instead of in ~/Documents.
+    /// Creates ~/Documents/CarvedJPEGs/<source file stem>/ and returns its URL.
+    /// Restored behaviour: place carved output in the user's Documents folder
+    /// rather than next to the source file (avoids permission issues).
     private func makeOutputFolder(for sourceURL: URL) throws -> URL {
-        let parent = sourceURL.deletingLastPathComponent()
         let stem = sourceURL.deletingPathExtension().lastPathComponent
-        let folder = parent
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
+
+        let folder = docs
             .appendingPathComponent("CarvedJPEGs")
             .appendingPathComponent(stem)
 
-        try FileManager.default.createDirectory(
-            at: folder,
-            withIntermediateDirectories: true
-        )
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder
     }
 
