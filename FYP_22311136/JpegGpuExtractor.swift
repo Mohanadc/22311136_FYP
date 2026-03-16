@@ -1,94 +1,63 @@
 import Foundation
 import Metal
 
-// Errors that can occur while initializing or running the extractor
-enum ExtractorError: Error {
-    case noDevice
-    case libraryNotFound
-    case functionNotFound
-    case pipelineError(Error)
-    case commandQueueUnavailable
-    case bufferCreationFailed
-    case fileReadError
-    case noFileTypesSelected
-}
+/// Metal-backed file carver that scans data in chunks using GPU compute shaders.
+///
+/// All shared types (`CarverError`, `FileType`, `Match`, etc.) live in
+/// `FileCarverTypes.swift`. Pair-matching is handled by `SignatureMatcher`.
+final class GpuFileCarver: FileCarver {
 
-// Supported file types and their numeric IDs (used by the GPU shader)
-enum FileType: UInt32 {
-    case jpeg = 0
-}
+    let name = "GPU"
 
-// A file signature containing header and footer byte sequences
-struct FileSignature {
-    let type: FileType
-    let header: [UInt8]
-    let footer: [UInt8]
-}
-
-// Represents a matched file type with header/footer offsets in absolute file coordinates
-struct Match {
-    let fileType: FileType
-    let headerOffset: Int
-    let footerOffset: Int
-}
-
-// Metal-backed extractor that scans file data in chunks for known file signatures
-final class Extractor {
-
-    static let shared: Extractor? = {
-        do { return try Extractor() }
-        catch { print("Extractor init failed: \(error)"); return nil }
+    static let shared: GpuFileCarver? = {
+        do { return try GpuFileCarver() }
+        catch { print("GpuFileCarver init failed: \(error)"); return nil }
     }()
 
-     // Chunking and buffer sizing constants used for GPU scanning
-     // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
-     static let chunkSize = 64 * 1024 * 1024
+    // Chunking and buffer sizing constants used for GPU scanning
+    // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
+    static let chunkSize = 64 * 1024 * 1024
 
-     // Overlap ensures markers straddling chunk boundaries are never missed
-     static let overlapSize  = 3
+    // Overlap ensures markers straddling chunk boundaries are never missed
+    static let overlapSize  = 3
 
-     // Hard cap on hits per chunk — bounds GPU buffer size and host processing work
-     // 1MB of hit slots = 256k UInt32 values = 128k hits.
-     static let maxHitsPerChunk = 131_072 // 128k hits per chunk
-
-     // Known signatures to scan for (header/footer pairs)
-     static let signatures: [FileSignature] = [
-         .init(type: .jpeg, header: [0xFF, 0xD8, 0xFF], footer: [0xFF, 0xD9])
-     ]
+    // Hard cap on hits per chunk — bounds GPU buffer size and host processing work
+    // 1MB of hit slots = 256k UInt32 values = 128k hits.
+    static let maxHitsPerChunk = 131_072 // 128k hits per chunk
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
 
-
-
     // Initialize Metal device, create command queue and compile the compute pipeline
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice()
-        else { throw ExtractorError.noDevice }
+        else { throw CarverError.noDevice }
         self.device = device
 
         guard let queue = device.makeCommandQueue()
-        else { throw ExtractorError.commandQueueUnavailable }
+        else { throw CarverError.commandQueueUnavailable }
         self.commandQueue = queue
 
         guard let library = device.makeDefaultLibrary()
-        else { throw ExtractorError.libraryNotFound }   
+        else { throw CarverError.libraryNotFound }
         guard let function = library.makeFunction(name: "searchJPEG")
-        else { throw ExtractorError.functionNotFound }
+        else { throw CarverError.functionNotFound }
 
         do { pipeline = try device.makeComputePipelineState(function: function) }
-        catch { throw ExtractorError.pipelineError(error) }
+        catch { throw CarverError.pipelineError(error) }
     }
 
-    // Public entry point: stream the file in fixed-size chunks, run GPU scan on
-    // each chunk and return absolute header/footer offsets found across the file.
-    func scanFile(url: URL, at fileTypes: Set<FileType>) async throws -> [Match] {
-        if(fileTypes.isEmpty) {
-            throw ExtractorError.noFileTypesSelected
+    // MARK: - FileCarver conformance
+
+    /// Stream the file in fixed-size chunks, run GPU scan on each chunk,
+    /// and return absolute header/footer offsets found across the file.
+    func scanFile(url: URL, fileTypes: Set<FileType>) async throws -> [Match] {
+        if fileTypes.isEmpty {
+            throw CarverError.noFileTypesSelected
         }
         guard let fileHandle = try? FileHandle(forReadingFrom: url)
-        else { throw ExtractorError.fileReadError }
+        else { throw CarverError.fileReadError }
         defer { try? fileHandle.close() }
 
         let fileSize = try FileManager.default
@@ -123,32 +92,16 @@ final class Extractor {
             fileOffset += Self.chunkSize
         }
 
-        return pairHeadersWithFooters(headers: allHeaders, footers: allFooters)
+        return SignatureMatcher.pairHeadersWithFooters(
+            headers: allHeaders,
+            footers: allFooters
+        )
     }
 
-    // Pair sorted headers with their nearest following footer to construct matches
-    private func pairHeadersWithFooters(
-        headers: [Int],
-        footers: [Int]
-    ) -> [Match] {
-        var matches: [Match] = []
-        var footerIndex = 0
+    // MARK: - GPU scanning
 
-        for header in headers {
-            // Find the first footer that comes after this header
-            while footerIndex < footers.count && footers[footerIndex] <= header {
-                footerIndex += 1
-            }
-            guard footerIndex < footers.count else { break }
-            matches.append(Match(fileType: .jpeg, headerOffset: header, footerOffset: footers[footerIndex]))
-            footerIndex += 1
-        }
-
-        return matches
-    }
-
-    // Run the Metal compute shader on a single data chunk and return the
-    // header/footer offsets that the GPU identified (chunk-local offsets).
+    /// Run the Metal compute shader on a single data chunk and return the
+    /// header/footer offsets that the GPU identified (chunk-local offsets).
     func scan(data: Data) async throws -> (headers: [Int], footers: [Int]) {
         let dataSize = data.count
         let maxHits  = Self.maxHitsPerChunk * 2 // *2 because each hit = (offset + type)
@@ -165,17 +118,17 @@ final class Extractor {
                 options: .storageModeShared,
                 deallocator: nil
             )
-        }) else { throw ExtractorError.bufferCreationFailed }
+        }) else { throw CarverError.bufferCreationFailed }
 
         guard let hitsBuffer = device.makeBuffer(
             length: maxHits * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
-        ) else { throw ExtractorError.bufferCreationFailed }
+        ) else { throw CarverError.bufferCreationFailed }
 
         guard let countBuffer = device.makeBuffer(
             length: MemoryLayout<UInt32>.stride,
             options: .storageModeShared
-        ) else { throw ExtractorError.bufferCreationFailed }
+        ) else { throw CarverError.bufferCreationFailed }
 
         countBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
 
@@ -185,7 +138,7 @@ final class Extractor {
 
         guard let cmd = commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder()
-        else { throw ExtractorError.commandQueueUnavailable }
+        else { throw CarverError.commandQueueUnavailable }
 
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(dataBuffer,  offset: 0, index: 0)
@@ -203,31 +156,18 @@ final class Extractor {
         enc.endEncoding()
 
         return try await withCheckedThrowingContinuation { continuation in
-            // Bridge the GPU's asynchronous command-buffer completion into async/await.
-            // The command buffer runs on the GPU; when it finishes the completion
-            // handler is invoked and we can safely read back GPU-produced buffers.
             cmd.addCompletedHandler { [hitsBuffer, countBuffer] _ in
-                // Read how many UInt32 slots the GPU wrote into countBuffer.
-                // (Each hit is two UInt32s: offset + type.)
                 let count = Int(countBuffer.contents().load(as: UInt32.self))
-
-                // Parse the raw hits buffer into sorted header/footer arrays.
-                // parseHits handles clamping to the allocated capacity and sorting.
                 let (headers, footers) = self.parseHits(hitsBuffer: hitsBuffer, count: count)
-
-                // Resume the awaiting async caller with the parsed results.
                 continuation.resume(returning: (headers, footers))
             }
-
-            // Submit the command buffer to the GPU for execution.
-            // The completion handler above will run after the GPU work finishes.
             cmd.commit()
         }
     }
 
-    // Parse the raw GPU hits buffer into sorted header/footer offset arrays.
-    // - `hitsBuffer` contains pairs of UInt32 (offset, type)
-    // - `count` is the number of UInt32 slots the GPU wrote (may be > 2*maxHitsPerChunk)
+    // MARK: - Hit parsing
+
+    /// Parse the raw GPU hits buffer into sorted header/footer offset arrays.
     private func parseHits(hitsBuffer: MTLBuffer, count: Int) -> (headers: [Int], footers: [Int]) {
         let hitsPtr = hitsBuffer.contents().assumingMemoryBound(to: UInt32.self)
 

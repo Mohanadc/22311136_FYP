@@ -4,6 +4,13 @@ import ImageIO
 import UniformTypeIdentifiers
 import Metal
 
+/// Scanning mode for performance comparison
+enum ScanningMode: String, CaseIterable, Identifiable {
+    case gpu = "GPU"
+    case cpu = "CPU"
+    var id: String { rawValue }
+}
+
 struct ContentView: View {
     @State private var output: String = "Ready to carve JPEG files"
     @State private var isSelectingFile = false
@@ -12,6 +19,9 @@ struct ContentView: View {
     @State private var isCarving = false
     @State private var finishedCarving = false
     @State private var savedFileURLs: [URL] = []
+
+    // Scanning mode: GPU (Metal) or CPU (sequential baseline)
+    @State private var scanningMode: ScanningMode = .gpu
 
     // Available file types to display; populate from your supported signatures
     @State private var fileTypes: [FileType] = [.jpeg]
@@ -93,6 +103,26 @@ struct ContentView: View {
                     }
                 }
 
+                // Scanning mode picker
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Scanning Mode")
+                        .font(.headline)
+                    Picker("Mode", selection: $scanningMode) {
+                        ForEach(ScanningMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(scanningMode == .gpu
+                         ? "Metal GPU parallelisation — fastest on supported hardware."
+                         : "Sequential CPU baseline — single-threaded, no acceleration.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding()
+                .background(.thickMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
                 // Options
                 VStack(alignment: .leading, spacing: 8) {
                     Text("File types to scan")
@@ -153,16 +183,32 @@ struct ContentView: View {
         isCarving = true
         savedFileURLs = []
         finishedCarving = false
-    output = "Starting carving for: \(selectedFileTypesText)\n"
+    output = "Starting carving [\(scanningMode.rawValue)] for: \(selectedFileTypesText)\n"
 
         Task {
             do {
+                // Select carver based on scanning mode
+                let carver: FileCarver
+                switch scanningMode {
+                case .gpu:
+                    guard let gpuCarver = GpuFileCarver.shared else {
+                        await MainActor.run {
+                            output += "Error: GPU (Metal) not available\n"
+                            isCarving = false
+                        }
+                        return
+                    }
+                    carver = gpuCarver
+                case .cpu:
+                    carver = CpuFileCarver()
+                }
+
                 let startTime = CFAbsoluteTimeGetCurrent()
-                try await performJPEGCarving(on: selectedFilePath)
+                try await performJPEGCarving(on: selectedFilePath, carver: carver)
                 let elapsed = CFAbsoluteTimeGetCurrent() - startTime
 
                 await MainActor.run {
-                    output += "Time elapsed: \(String(format: "%.2f", elapsed))s\n"
+                    output += "\n⏱ Time elapsed [\(scanningMode.rawValue)]: \(String(format: "%.4f", elapsed))s\n"
                     output += "\n✓ JPEG carving complete!"
                     isCarving = false
                     finishedCarving = true
@@ -183,7 +229,7 @@ struct ContentView: View {
         NSWorkspace.shared.activateFileViewerSelecting([first])
     }
 
-    private func performJPEGCarving(on filePath: String) async throws {
+    private func performJPEGCarving(on filePath: String, carver: FileCarver) async throws {
         let fileURL = URL(fileURLWithPath: filePath)
         await MainActor.run { output += "Attempting to open file: \(filePath)\n" }
 
@@ -194,20 +240,14 @@ struct ContentView: View {
         defer { if startedAccess { fileURL.stopAccessingSecurityScopedResource() } }
 
         // ── Prepare output folder ─────────────────────────────────────────────
-        // Creates a subfolder named after the source file inside ~/Documents/CarvedJPEGs/
-        // e.g. ~/Documents/CarvedJPEGs/disk_image/carved_0.jpg
         let outputFolder = try makeOutputFolder(for: fileURL)
         await MainActor.run { output += "Output folder: \(outputFolder.path)\n"
         output += "File: \(fileURL.lastPathComponent)\n"  }
 
-        guard let extractor = Extractor.shared else {
-            throw NSError(domain: "CarverError", code: -4,
-                          userInfo: [NSLocalizedDescriptionKey: "Extractor (Metal) not available"])
-        }
+        await MainActor.run { output += "Scanning mode: \(carver.name)\n" }
 
         // ── Scan (streaming) ───────────────────────────────────────────────────
-        // Use the URL-based streaming scan to avoid loading the whole file into memory.
-        let matches = try await extractor.scanFile(url: fileURL, at: selectedFileTypes)
+        let matches = try await carver.scanFile(url: fileURL, fileTypes: selectedFileTypes)
 
         await MainActor.run {
             output += "Found \(matches.count) JPEG(s)\n\n--- CARVING ---\n"
