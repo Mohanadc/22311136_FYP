@@ -21,6 +21,8 @@ enum SignatureMatcher {
         var matches: [Match] = []
         var footerIndex = 0
 
+        headers.sort()
+        footers.sort()
         for header in headers {
             // Advance past any footers that are at or before this header
             while footerIndex < footers.count && footers[footerIndex] <= header {

@@ -52,10 +52,7 @@ final class GpuFileCarver: FileCarver {
 
     /// Stream the file in fixed-size chunks, run GPU scan on each chunk,
     /// and return absolute header/footer offsets found across the file.
-    func scanFile(url: URL, fileTypes: Set<FileType>) async throws -> [Match] {
-        if fileTypes.isEmpty {
-            throw CarverError.noFileTypesSelected
-        }
+    func scanFile(url: URL) async throws -> [Match] {
         guard let fileHandle = try? FileHandle(forReadingFrom: url)
         else { throw CarverError.fileReadError }
         defer { try? fileHandle.close() }
@@ -181,9 +178,6 @@ final class GpuFileCarver: FileCarver {
             if type == 0 { headers.append(offset) }
             else         { footers.append(offset) }
         }
-
-        headers.sort()
-        footers.sort()
         return (headers, footers)
     }
 }

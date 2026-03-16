@@ -7,10 +7,11 @@ import Foundation
 final class CpuFileCarver: FileCarver {
 
     let name = "CPU"
-
+    
+    static let shared: CpuFileCarver? = { do { return try CpuFileCarver() } catch { print("CpuFileCarver init failed: \(error)"); return nil } }()
     // Use the same chunking constants as the GPU carver for a fair comparison
     static let chunkSize    = 64 * 1024 * 1024   // 64 MB
-    static let overlapSize  = 3                    // bytes of overlap between chunks
+    static let overlapSize  = 3                    // data of overlap between chunks
 
     func scanFile(url: URL, fileTypes: Set<FileType>) async throws -> [Match] {
         guard !fileTypes.isEmpty else {
@@ -27,7 +28,7 @@ final class CpuFileCarver: FileCarver {
 
         // Collect the signatures we need to scan for
         let activeSignatures = KnownSignatures.all.filter { fileTypes.contains($0.type) }
-
+        print("Active signatures: \(activeSignatures)")
         var allHeaders: [Int] = []
         var allFooters: [Int] = []
         var fileOffset = 0
@@ -37,8 +38,8 @@ final class CpuFileCarver: FileCarver {
             let chunkData = fileHandle.readData(ofLength: readSize)
             if chunkData.isEmpty { break }
 
-            let bytes = [UInt8](chunkData)
-            let (headers, footers) = scanChunk(bytes: bytes, signatures: activeSignatures)
+            let data = [UInt8](chunkData)
+            let (headers, footers) = scanChunk(data: data, signatures: activeSignatures)
 
             // Translate chunk-relative offsets to absolute file offsets,
             // skipping anything in the overlap region of the PREVIOUS chunk
@@ -62,19 +63,20 @@ final class CpuFileCarver: FileCarver {
 
     // MARK: - Sequential byte scan
 
-    /// Scan a single chunk of bytes sequentially for header and footer markers.
+    /// Scan a single chunk of data sequentially for header and footer markers.
     ///
     /// This is the hot path that the GPU replaces with massively-parallel execution.
     /// Intentionally kept single-threaded for a clean baseline measurement.
     private func scanChunk(
-        bytes: [UInt8],
+        data: [UInt8],
         signatures: [FileSignature]
     ) -> (headers: [Int], footers: [Int]) {
         var headers: [Int] = []
         var footers: [Int] = []
-        let count = bytes.count
+        let count = data.count
 
         for sig in signatures {
+            print("Scanning for signature: \(sig)")
             let headerLen = sig.header.count
             let footerLen = sig.footer.count
 
@@ -84,7 +86,7 @@ final class CpuFileCarver: FileCarver {
                 for i in 0...limit {
                     var matched = true
                     for j in 0..<headerLen {
-                        if bytes[i + j] != sig.header[j] {
+                        if data[i + j] != sig.header[j] {
                             matched = false
                             break
                         }
@@ -101,7 +103,7 @@ final class CpuFileCarver: FileCarver {
                 for i in 0...limit {
                     var matched = true
                     for j in 0..<footerLen {
-                        if bytes[i + j] != sig.footer[j] {
+                        if data[i + j] != sig.footer[j] {
                             matched = false
                             break
                         }
@@ -112,9 +114,6 @@ final class CpuFileCarver: FileCarver {
                 }
             }
         }
-
-        headers.sort()
-        footers.sort()
         return (headers, footers)
     }
 }
