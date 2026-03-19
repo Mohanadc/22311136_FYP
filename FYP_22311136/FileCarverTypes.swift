@@ -42,7 +42,7 @@ struct Match {
 // MARK: - Known Signatures
 
 /// Central registry of known file signatures
-enum KnownSignatures {
+enum FileSignatures {
     static let all: [FileSignature] = [
         .init(type: .jpeg, header: [0xFF, 0xD8, 0xFF], footer: [0xFF, 0xD9])
     ]

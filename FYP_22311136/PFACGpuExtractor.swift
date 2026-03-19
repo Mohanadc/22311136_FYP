@@ -1,35 +1,22 @@
 import Foundation
 import Metal
 
-/// Metal-backed file carver that scans data in chunks using GPU compute shaders.
-///
-/// All shared types (`CarverError`, `FileType`, `Match`, etc.) live in
-/// `FileCarverTypes.swift`. Pair-matching is handled by `SignatureMatcher`.
-final class GpuFileCarver: FileCarver {
+final class PFACGpuExtractor: FileCarver {
+    let name = "PFAC GPU"
 
-    let name = "GPU"
-
-    static let shared: GpuFileCarver? = {
-        do { return try GpuFileCarver() }
-        catch { print("GpuFileCarver init failed: \(error)"); return nil }
+    static let shared: PFACGpuExtractor? = {
+        do { return try PFACGpuExtractor() }
+        catch { print("PFACGpuExtractor init failed: \(error)"); return nil }
     }()
-
-    // Chunking and buffer sizing constants used for GPU scanning
-    // 64MB chunks — fits comfortably in GPU memory, large enough to amortise overhead
-    static let chunkSize = 64 * 1024 * 1024
-
-    // Overlap ensures markers straddling chunk boundaries are never missed
-    static let overlapSize  = 3
-
-    // Hard cap on hits per chunk — bounds GPU buffer size and host processing work
-    // 1MB of hit slots = 256k UInt32 values = 128k hits.
-    static let maxHitsPerChunk = 131_072 // 128k hits per chunk
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
 
-    // Initialize Metal device, create command queue and compile the compute pipeline
+    static let chunkSize       = 64 * 1024 * 1024
+    static let overlapSize     = 3
+    static let maxHitsPerChunk = 131_072
+
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice()
         else { throw CarverError.noDevice }
@@ -41,7 +28,7 @@ final class GpuFileCarver: FileCarver {
 
         guard let library = device.makeDefaultLibrary()
         else { throw CarverError.libraryNotFound }
-        guard let function = library.makeFunction(name: "searchJPEG")
+        guard let function = library.makeFunction(name: "pfacScan")
         else { throw CarverError.functionNotFound }
 
         do { pipeline = try device.makeComputePipelineState(function: function) }
@@ -50,9 +37,9 @@ final class GpuFileCarver: FileCarver {
 
     // MARK: - FileCarver conformance
 
-    /// Stream the file in fixed-size chunks, run GPU scan on each chunk,
-    /// and return absolute header/footer offsets found across the file.
-    func scanFile(url: URL) async throws -> [Match] {
+    func scanFile(url: URL, fileTypes: Set<FileType>) async throws -> [Match] {
+        guard !fileTypes.isEmpty else { throw CarverError.noFileTypesSelected }
+
         guard let fileHandle = try? FileHandle(forReadingFrom: url)
         else { throw CarverError.fileReadError }
         defer { try? fileHandle.close() }
@@ -60,22 +47,32 @@ final class GpuFileCarver: FileCarver {
         let fileSize = try FileManager.default
             .attributesOfItem(atPath: url.path)[.size] as? Int ?? 0
 
+        // build trie once from all selected file types — reused across all chunks
+        let activeSignatures = FileSignatures.all.filter { fileTypes.contains($0.type) }
+        var signatureTrie = PFACTrie()
+        for sig in activeSignatures {
+            if !sig.header.isEmpty {
+                signatureTrie.insert(pattern: sig.header, matchType: PFACTrie.matchTypeHeader)
+            }
+            if !sig.footer.isEmpty {
+                signatureTrie.insert(pattern: sig.footer, matchType: PFACTrie.matchTypeFooter)
+            }
+        }
+
         var allHeaders: [Int] = []
         var allFooters: [Int] = []
         var fileOffset = 0
 
         while fileOffset < fileSize {
-            // Read chunk + overlap so markers at boundaries are not split
-            let readSize   = min(Self.chunkSize + Self.overlapSize, fileSize - fileOffset)
-            let chunkData  = fileHandle.readData(ofLength: readSize)
+            let readSize  = min(Self.chunkSize + Self.overlapSize, fileSize - fileOffset)
+            let chunkData = fileHandle.readData(ofLength: readSize)
             if chunkData.isEmpty { break }
 
-            let (headers, footers) = try await scan(data: chunkData)
+            let (headers, footers) = try await scanChunk(
+                data: chunkData,
+                signatureTrie: signatureTrie
+            )
 
-            // Translate chunk-relative offsets to absolute file offsets,
-            // but skip anything that falls inside the overlap region of the
-            // PREVIOUS chunk (i.e. offset < overlapSize when fileOffset > 0)
-            // to avoid duplicates.
             let minOffset = fileOffset == 0 ? 0 : Self.overlapSize
 
             for h in headers where h >= minOffset {
@@ -85,7 +82,6 @@ final class GpuFileCarver: FileCarver {
                 allFooters.append(fileOffset + f)
             }
 
-            // Advance by chunkSize only — the overlap bytes get re-read next iteration
             fileOffset += Self.chunkSize
         }
 
@@ -95,18 +91,14 @@ final class GpuFileCarver: FileCarver {
         )
     }
 
-    // MARK: - GPU scanning
+    // MARK: - Chunk scanning
 
-    /// Run the Metal compute shader on a single data chunk and return the
-    /// header/footer offsets that the GPU identified (chunk-local offsets).
-    func scan(data: Data) async throws -> (headers: [Int], footers: [Int]) {
+    func scanChunk(data: Data, signatureTrie: PFACTrie) async throws -> (headers: [Int], footers: [Int]) {
         let dataSize = data.count
-        let maxHits  = Self.maxHitsPerChunk * 2 // *2 because each hit = (offset + type)
+        let maxHits  = Self.maxHitsPerChunk * 2
 
-        // Create GPU buffers:
-        // - dataBuffer shares the chunk data with the GPU without copying
-        // - hitsBuffer is where the GPU writes found offsets and types (UInt32 pairs)
-        // - countBuffer is a single UInt32 that the GPU atomically increments for each hit
+        // MARK: Buffer creation — all buffers ready before command buffer is created
+
         guard let dataBuffer: MTLBuffer = data.withUnsafeBytes({ ptr in
             guard let base = ptr.baseAddress else { return nil }
             return device.makeBuffer(
@@ -127,11 +119,19 @@ final class GpuFileCarver: FileCarver {
             options: .storageModeShared
         ) else { throw CarverError.bufferCreationFailed }
 
+        guard let trieBuffer = device.makeBuffer(
+            bytes: signatureTrie.flattened,
+            length: signatureTrie.flattened.count * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else { throw CarverError.bufferCreationFailed }
+
+        // zero the hit counter before dispatch
         countBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
 
         var dataSizeU32 = UInt32(dataSize)
-        // Pass the cap to the shader so it stops writing if the buffer is full
         var maxHitsU32  = UInt32(maxHits)
+
+        // MARK: Command encoding
 
         guard let cmd = commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder()
@@ -143,14 +143,19 @@ final class GpuFileCarver: FileCarver {
         enc.setBuffer(countBuffer, offset: 0, index: 2)
         enc.setBytes(&dataSizeU32, length: MemoryLayout<UInt32>.stride, index: 3)
         enc.setBytes(&maxHitsU32,  length: MemoryLayout<UInt32>.stride, index: 4)
+        enc.setBuffer(trieBuffer,  offset: 0, index: 5)
 
         let threadsPerGrid  = MTLSize(width: dataSize, height: 1, depth: 1)
         let threadsPerGroup = MTLSize(
             width: min(pipeline.maxTotalThreadsPerThreadgroup, 1024),
-            height: 1, depth: 1
+            height: 1,
+            depth: 1
         )
+
         enc.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerGroup)
         enc.endEncoding()
+
+        // MARK: Completion
 
         return try await withCheckedThrowingContinuation { continuation in
             cmd.addCompletedHandler { [hitsBuffer, countBuffer] _ in
@@ -164,20 +169,23 @@ final class GpuFileCarver: FileCarver {
 
     // MARK: - Hit parsing
 
-    /// Parse the raw GPU hits buffer into sorted header/footer offset arrays.
     private func parseHits(hitsBuffer: MTLBuffer, count: Int) -> (headers: [Int], footers: [Int]) {
-        let hitsPtr = hitsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+        let ptr = hitsBuffer.contents().assumingMemoryBound(to: UInt32.self)
 
         var headers: [Int] = []
         var footers: [Int] = []
 
+        // count/2 because each hit = 2 UInt32s (offset + matchType)
         let safeCount = min(count / 2, Self.maxHitsPerChunk)
         for i in 0..<safeCount {
-            let offset = Int(hitsPtr[i * 2])
-            let type   = Int(hitsPtr[i * 2 + 1])
-            if type == 0 { headers.append(offset) }
-            else         { footers.append(offset) }
+            let offset    = Int(ptr[i * 2])
+            let matchType = Int(ptr[i * 2 + 1])
+            if matchType == 1 { headers.append(offset) }
+            if matchType == 2 { footers.append(offset) }
         }
+
+        headers.sort()
+        footers.sort()
         return (headers, footers)
     }
 }

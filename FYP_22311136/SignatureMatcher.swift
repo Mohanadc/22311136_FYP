@@ -21,18 +21,21 @@ enum SignatureMatcher {
         var matches: [Match] = []
         var footerIndex = 0
 
-        headers.sort()
-        footers.sort()
-        for header in headers {
+        // Parameters are immutable (`let`) — create local sorted copies to avoid
+        // attempting to call mutating methods on them.
+        let sortedHeaders = headers.sorted()
+        let sortedFooters = footers.sorted()
+
+        for header in sortedHeaders {
             // Advance past any footers that are at or before this header
-            while footerIndex < footers.count && footers[footerIndex] <= header {
+            while footerIndex < sortedFooters.count && sortedFooters[footerIndex] <= header {
                 footerIndex += 1
             }
-            guard footerIndex < footers.count else { break }
+            guard footerIndex < sortedFooters.count else { break }
             matches.append(Match(
                 fileType: .jpeg,
                 headerOffset: header,
-                footerOffset: footers[footerIndex]
+                footerOffset: sortedFooters[footerIndex]
             ))
             footerIndex += 1
         }

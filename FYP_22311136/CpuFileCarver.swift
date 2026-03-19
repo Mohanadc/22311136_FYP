@@ -27,7 +27,7 @@ final class CpuFileCarver: FileCarver {
             .attributesOfItem(atPath: url.path)[.size] as? Int ?? 0
 
         // Collect the signatures we need to scan for
-        let activeSignatures = KnownSignatures.all.filter { fileTypes.contains($0.type) }
+        let activeSignatures = FileSignatures.all.filter { fileTypes.contains($0.type) }
         print("Active signatures: \(activeSignatures)")
         var allHeaders: [Int] = []
         var allFooters: [Int] = []
