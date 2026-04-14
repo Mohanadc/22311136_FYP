@@ -8,7 +8,12 @@ final class CpuFileCarver: FileCarver {
 
     let name = "CPU"
     
-    static let shared: CpuFileCarver? = { do { return try CpuFileCarver() } catch { print("CpuFileCarver init failed: \(error)"); return nil } }()
+    /// Factory-style accessor for symmetry with GPU carver; avoids keeping
+    /// unnecessary shared instances alive when not needed.
+    static var shared: CpuFileCarver? {
+        do { return try CpuFileCarver() }
+        catch { print("CpuFileCarver init failed: \(error)"); return nil }
+    }
     // Use the same chunking constants as the GPU carver for a fair comparison
     static let chunkSize    = 64 * 1024 * 1024   // 64 MB
     static let overlapSize  = 3                    // data of overlap between chunks
@@ -35,7 +40,7 @@ final class CpuFileCarver: FileCarver {
 
         while fileOffset < fileSize {
             let readSize  = min(Self.chunkSize + Self.overlapSize, fileSize - fileOffset)
-            let chunkData = fileHandle.readData(ofLength: readSize)
+            let chunkData = autoreleasepool { fileHandle.readData(ofLength: readSize) }
             if chunkData.isEmpty { break }
 
             let data = [UInt8](chunkData)

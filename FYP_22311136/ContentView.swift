@@ -191,14 +191,15 @@ struct ContentView: View {
                 let carver: FileCarver
                 switch scanningMode {
                 case .gpu:
-                    guard let gpuCarver = PFACGpuExtractor.shared else {
+                    do {
+                        carver = try PFACGpuExtractor()
+                    } catch {
                         await MainActor.run {
-                            output += "Error: GPU (Metal) not available\n"
+                            output += "Error: GPU (Metal) not available: \(error.localizedDescription)\n"
                             isCarving = false
                         }
                         return
                     }
-                    carver = gpuCarver
                 case .cpu:
                     carver = CpuFileCarver()
                 }

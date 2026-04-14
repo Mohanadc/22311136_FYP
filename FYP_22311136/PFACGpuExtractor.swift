@@ -4,10 +4,13 @@ import Metal
 final class PFACGpuExtractor: FileCarver {
     let name = "PFAC GPU"
 
-    static let shared: PFACGpuExtractor? = {
+    /// Factory-style accessor: returns a fresh extractor instance each time.
+    /// This avoids keeping Metal device/pipeline objects pinned in memory
+    /// for the entire app lifetime when not actively scanning.
+    static var shared: PFACGpuExtractor? {
         do { return try PFACGpuExtractor() }
         catch { print("PFACGpuExtractor init failed: \(error)"); return nil }
-    }()
+    }
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -65,7 +68,7 @@ final class PFACGpuExtractor: FileCarver {
 
         while fileOffset < fileSize {
             let readSize  = min(Self.chunkSize + Self.overlapSize, fileSize - fileOffset)
-            let chunkData = fileHandle.readData(ofLength: readSize)
+            let chunkData = autoreleasepool { fileHandle.readData(ofLength: readSize) }
             if chunkData.isEmpty { break }
 
             let (headers, footers) = try await scanChunk(
@@ -99,14 +102,14 @@ final class PFACGpuExtractor: FileCarver {
 
         // MARK: Buffer creation — all buffers ready before command buffer is created
 
-        guard let dataBuffer: MTLBuffer = data.withUnsafeBytes({ ptr in
-            guard let base = ptr.baseAddress else { return nil }
-            return device.makeBuffer(
-                bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
-                length: dataSize,
-                options: .storageModeShared,
-                deallocator: nil
-            )
+        // IMPORTANT: avoid `bytesNoCopy` with Data-backed memory here.
+        // `Data` storage can be reclaimed/moved after `withUnsafeBytes` returns,
+        // while GPU execution is still in flight, which leads to unstable memory
+        // behavior that often looks like leaks/corruption in profiling.
+        // Creating a copied MTLBuffer gives Metal-owned storage with a safe lifetime.
+        guard let dataBuffer = data.withUnsafeBytes({ ptr -> MTLBuffer? in
+            guard let base = ptr.baseAddress, dataSize > 0 else { return nil }
+            return device.makeBuffer(bytes: base, length: dataSize, options: .storageModeShared)
         }) else { throw CarverError.bufferCreationFailed }
 
         guard let hitsBuffer = device.makeBuffer(
